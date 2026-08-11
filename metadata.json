@@ -1,0 +1,6 @@
+{
+  "name": "OneGo",
+  "description": "A ride, food, and delivery aggregator cloning Grab's familiar interface for a seamless PH market comparison experience.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
