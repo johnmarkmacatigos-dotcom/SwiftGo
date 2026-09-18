@@ -1,0 +1,151 @@
+# ═══════════════════════════════════════════════════════════════
+# AETHER EXECUTOR — catches repository_dispatch from the Aether C2
+# plane, runs Claude Code against the intent, opens a PR, and
+# streams progress back to /api/ingest.
+#
+# Required repo secrets:
+#   ANTHROPIC_API_KEY    — Anthropic API key for Claude Code
+#   AETHER_INGEST_TOKEN  — same value as the Vercel env var
+#
+# Copy this file into any repo you want Aether to dispatch to
+# (a standalone template lives at docs/aether-executor-template.yml).
+# ═══════════════════════════════════════════════════════════════
+name: Aether Executor
+
+on:
+  repository_dispatch:
+    types: [aether-command]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: aether-${{ github.event.client_payload.command_id }}
+  cancel-in-progress: false
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CMD_ID:     ${{ github.event.client_payload.command_id }}
+      INGEST_URL: ${{ github.event.client_payload.ingest_url }}
+      INTENT:     ${{ github.event.client_payload.intent }}
+      BRANCH:     ${{ github.event.client_payload.branch }}
+      DRY_RUN:    ${{ github.event.client_payload.options.dry_run || false }}
+      AUTO_MERGE: ${{ github.event.client_payload.options.auto_merge || false }}
+      PROTECTED:  ${{ join(github.event.client_payload.protected_paths, ', ') }}
+
+    steps:
+      - name: Ingest helper
+        run: |
+          cat > /tmp/ingest.sh <<'SH'
+          #!/bin/bash
+          # usage: ingest.sh <phase> <level> <message> [meta-json]
+          curl -sf -X POST "$INGEST_URL" \
+            -H "Authorization: Bearer $AETHER_INGEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg id "$CMD_ID" --arg p "$1" --arg l "$2" --arg m "$3" --argjson meta "${4:-{}}" \
+                 '{command_id:$id, phase:$p, level:$l, message:$m, meta:$meta}')" || true
+          SH
+          chmod +x /tmp/ingest.sh
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Report received
+        run: /tmp/ingest.sh received info "Executor started on $GITHUB_REPOSITORY"
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create work branch
+        run: |
+          git checkout -b "$BRANCH"
+          /tmp/ingest.sh planning info "Branch $BRANCH created — invoking Claude Code"
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            ${{ env.DRY_RUN == 'true' && 'DRY RUN — produce a detailed plan of the changes you would make, written to PLAN.md. Do NOT modify any other files.' || 'Implement the following. Follow this repository''s CLAUDE.md conventions. Run existing tests and make them pass.' }}
+
+            INTENT: ${{ env.INTENT }}
+
+            ${{ env.PROTECTED != '' && format('PROTECTED PATHS — do not modify anything under: {0}', env.PROTECTED) || '' }}
+          claude_args: "--allowedTools 'Edit,Write,Read,Glob,Grep,Bash(npm:*),Bash(node:*),Bash(git:*)'"
+
+      - name: Report editing done
+        run: /tmp/ingest.sh editing info "Claude Code finished — checking for changes"
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Run tests
+        id: tests
+        run: |
+          /tmp/ingest.sh testing info "Running test suite"
+          if [ -f package.json ] && jq -e '.scripts.test' package.json > /dev/null; then
+            npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
+            npm test
+          else
+            echo "No test script — skipping"
+          fi
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Commit and push
+        id: push
+        run: |
+          git config user.name  "aether-executor"
+          git config user.email "aether-executor@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            /tmp/ingest.sh done win "No changes needed for this intent"
+          else
+            git commit -m "aether: $INTENT"
+            git push -u origin "$BRANCH"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Dry-run report
+        if: env.DRY_RUN == 'true' && steps.push.outputs.changed == 'true'
+        run: |
+          PLAN=$(head -c 1500 PLAN.md 2>/dev/null || echo "See branch $BRANCH")
+          /tmp/ingest.sh dryrun win "Dry run complete" "$(jq -nc --arg plan "$PLAN" '{plan:$plan}')"
+          /tmp/ingest.sh done win "Dry run — plan on branch $BRANCH, no PR opened"
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Open PR
+        id: pr
+        if: env.DRY_RUN != 'true' && steps.push.outputs.changed == 'true'
+        run: |
+          /tmp/ingest.sh deploying info "Opening pull request"
+          PR_URL=$(gh pr create \
+            --title "aether: $INTENT" \
+            --body "Dispatched by Aether C2 — command \`$CMD_ID\`" \
+            --head "$BRANCH" --base "${GITHUB_REF_NAME:-main}" 2>/dev/null || gh pr view "$BRANCH" --json url -q .url)
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+          if [ "$AUTO_MERGE" = "true" ]; then
+            gh pr merge "$PR_URL" --auto --squash || true
+          fi
+          /tmp/ingest.sh done win "PR ready" "$(jq -nc --arg pr "$PR_URL" '{pr_url:$pr}')"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Report failure
+        if: failure()
+        run: /tmp/ingest.sh failed err "Executor failed at step ${{ github.job }} — see $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
