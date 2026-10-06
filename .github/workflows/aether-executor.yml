@@ -3,9 +3,28 @@
 # plane, runs Claude Code against the intent, opens a PR, and
 # streams progress back to /api/ingest.
 #
-# Required repo secrets:
-#   ANTHROPIC_API_KEY    — Anthropic API key for Claude Code
-#   AETHER_INGEST_TOKEN  — same value as the Vercel env var
+# Repo secrets:
+#   CLAUDE_CODE_OAUTH_TOKEN — recommended: runs on your Claude Pro/Max
+#                             subscription, no per-token API bill. Create it
+#                             with `claude setup-token` (Claude Code CLI).
+#   ANTHROPIC_API_KEY       — optional fallback, used only when there is no
+#                             CLAUDE_CODE_OAUTH_TOKEN; billed per token.
+#   AETHER_INGEST_TOKEN     — same value as the Vercel env var
+#
+# CONTAINED MODE (project setting "Run the agent contained in an OpenShell
+# sandbox"): Claude Code — still on your Claude subscription — runs inside an
+# NVIDIA OpenShell sandbox instead of straight on the runner:
+#   - kernel-enforced file and syscall limits; every outbound connection is
+#     checked against a policy AETHER sends (the project's allow list)
+#   - the subscription token is held by OpenShell and injected only into the
+#     claude binary's requests to api.anthropic.com; the agent sees a
+#     placeholder, and nothing else in the sandbox (tests included) can use it
+#   - the agent has no GitHub credential: the runner copies its changes out
+#     (never .git, .github or protected paths) and does the commit, push and
+#     PR itself; tests run inside the sandbox, never on the runner
+#   - anything the sandbox refuses is sent to AETHER, which opens an Access
+#     Gate on the deck: ALLOW adds it to the project's allow list for the
+#     next run, DENY keeps it refused
 #
 # Copy this file into any repo you want Aether to dispatch to
 # (a standalone template lives at docs/aether-executor-template.yml).
@@ -36,6 +55,8 @@ jobs:
       DRY_RUN:    ${{ github.event.client_payload.options.dry_run || false }}
       AUTO_MERGE: ${{ github.event.client_payload.options.auto_merge || false }}
       PROTECTED:  ${{ join(github.event.client_payload.protected_paths, ', ') }}
+      CONTAINED:  ${{ github.event.client_payload.containment.mode == 'contained' }}
+      ALLOW_JSON: ${{ toJSON(github.event.client_payload.containment.allow) }}
 
     steps:
       - name: Ingest helper
@@ -58,6 +79,22 @@ jobs:
         env:
           AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
 
+      - name: Check Claude credentials
+        run: |
+          if [ "$CONTAINED" = "true" ] && [ -z "$OAUTH" ]; then
+            /tmp/ingest.sh failed err "Contained runs need the CLAUDE_CODE_OAUTH_TOKEN repo secret in $GITHUB_REPOSITORY (claude setup-token; ⟳ SYNC EXECUTORS copies it from Vercel)"
+            exit 1
+          fi
+          if [ -z "$OAUTH" ] && [ -z "$API_KEY" ]; then
+            /tmp/ingest.sh failed err "No Claude credentials in $GITHUB_REPOSITORY — add the CLAUDE_CODE_OAUTH_TOKEN repo secret (claude setup-token)"
+            exit 1
+          fi
+          if [ -n "$OAUTH" ]; then echo "Using Claude subscription (CLAUDE_CODE_OAUTH_TOKEN)"; else echo "Using ANTHROPIC_API_KEY (billed per token)"; fi
+        env:
+          OAUTH:   ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -69,11 +106,145 @@ jobs:
         env:
           AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
 
+      # ── contained mode: the agent works inside an OpenShell sandbox ──
+      - name: Contained — start the sandbox
+        if: env.CONTAINED == 'true'
+        timeout-minutes: 10
+        run: |
+          /tmp/ingest.sh planning info "Starting an OpenShell sandbox for the agent"
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+          # the model endpoint: a provider that holds the subscription token and injects it as a
+          # Bearer header — to api.anthropic.com only, and only for the native claude binary
+          cat > /tmp/claude-subscription.yaml <<'YAML'
+          id: claude-subscription
+          display_name: Claude subscription
+          description: Claude Code on a Claude Pro/Max subscription token (claude setup-token)
+          category: agent
+          inference_capable: true
+          credentials:
+            - name: oauth_token
+              description: Claude subscription token
+              env_vars: [CLAUDE_CODE_OAUTH_TOKEN]
+              required: true
+              auth_style: bearer
+              header_name: authorization
+          discovery:
+            credentials: [oauth_token]
+          endpoints:
+            - host: api.anthropic.com
+              port: 443
+              protocol: rest
+              access: read-write
+              enforcement: enforce
+          binaries: [/usr/local/bin/claude]
+          YAML
+          openshell provider profile import -f /tmp/claude-subscription.yaml --global
+          openshell provider create --name claude --type claude-subscription --from-existing
+          # the agent image: Claude Code's native binary (so only it can carry the token), node/npm/git
+          # so tests run inside too, a non-root user (OpenShell refuses root), the repo in /workspace
+          mkdir -p /tmp/agent-img && cat > /tmp/agent-img/Dockerfile <<'DOCKER'
+          FROM node:24-bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git ripgrep \
+           && rm -rf /var/lib/apt/lists/*
+          RUN curl -fsSL https://claude.ai/install.sh | bash \
+           && cp -L "$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude && chmod 755 /usr/local/bin/claude \
+           && rm -rf /root/.local/share/claude /root/.local/bin/claude
+          RUN mkdir -p /workspace && chown node:node /workspace
+          ENV HOME=/tmp/agent-home npm_config_cache=/tmp/agent-home/.npm \
+              DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+          USER node
+          WORKDIR /workspace
+          CMD ["sleep", "3000"]
+          DOCKER
+          docker build -q -t aether-agent:local /tmp/agent-img
+          # the policy: what the agent may read and write (anything unlisted is off limits), and
+          # everything it may reach besides the model — this project's allow list, from AETHER
+          {
+            echo "version: 1"
+            echo "filesystem_policy:"
+            echo "  include_workdir: true"
+            echo "  read_only: [/bin, /sbin, /usr, /lib, /etc, /app, /var/log, /proc, /dev/urandom]"
+            echo "  read_write: [/tmp, /dev/null, /workspace]"
+            if [ "$(echo "$ALLOW_JSON" | jq 'length // 0')" = "0" ]; then echo "network_policies: {}"; else
+              echo "network_policies:"
+              echo "$ALLOW_JSON" | jq -r 'to_entries[] | .key as $i | .value as $e |
+                ("aether_" + (($i+1)|tostring) + "_" + ($e.host|gsub("[^a-z0-9]+";"_"))) as $n |
+                "  \($n):\n    name: \($n)\n    endpoints:\n      - host: \($e.host)\n        port: \($e.port // 443)\n        protocol: rest\n        enforcement: enforce\n        access: \($e.access // "read-only")\n    binaries:\n      - path: \($e.binary // "/usr/local/bin/claude")"'
+            fi
+          } > /tmp/aether-policy.yaml
+          cat /tmp/aether-policy.yaml
+          nohup openshell sandbox create --name aether-job --from aether-agent:local --provider claude \
+            --policy /tmp/aether-policy.yaml -- sleep 3000 > /tmp/sandbox-create.log 2>&1 < /dev/null &
+          for i in $(seq 1 90); do
+            P=$(openshell sandbox get aether-job 2>/dev/null | grep -o 'Phase: [A-Za-z]*' || true)
+            case "$P" in *Ready*|*Error*) break;; esac; sleep 4
+          done
+          case "$P" in *Ready*) ;; *) tail -30 /tmp/sandbox-create.log; /tmp/ingest.sh failed err "The OpenShell sandbox didn't start ($P)"; exit 1;; esac
+          echo "SBX_WORK=/workspace/repo" >> "$GITHUB_ENV"
+          # a copy without .git: actions/checkout keeps the GitHub token in .git/config
+          # (upload keeps the folder's name, like cp -r: /tmp/sbx/repo lands at /workspace/repo)
+          mkdir -p /tmp/sbx && rsync -a --exclude .git ./ /tmp/sbx/repo/
+          openshell sandbox upload aether-job /tmp/sbx/repo /workspace </dev/null
+          /tmp/ingest.sh planning info "Sandbox ready — Claude Code on your subscription (token injected by OpenShell, never visible to the agent)"
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Contained — the agent works
+        if: env.CONTAINED == 'true'
+        timeout-minutes: 20
+        run: |
+          PROMPT="$( [ "$DRY_RUN" = "true" ] && echo 'DRY RUN — produce a detailed plan of the changes you would make, written to PLAN.md. Do NOT modify any other files.' || echo 'Implement the following in this repository. Follow its CLAUDE.md / README conventions. Do not touch .github/.' )
+
+          INTENT: $INTENT
+          $( [ -n "$PROTECTED" ] && echo "PROTECTED PATHS — do not modify anything under: $PROTECTED" )"
+          # arguments are passed as-is (not through a shell), so the intent can't inject commands
+          # --dangerously-skip-permissions: inside the sandbox, OpenShell's policy is the boundary
+          openshell sandbox exec -n aether-job -- sh -c 'cd "$1" && exec claude -p "$2" --dangerously-skip-permissions' sh "$SBX_WORK" "$PROMPT" </dev/null || echo "agent exited with $?"
+          # tests run inside the sandbox too — never agent-written code on the runner.
+          # npm install needs registry.npmjs.org on the allow list; if it isn't, the refusal becomes a gate.
+          if [ -f package.json ] && jq -e '.scripts.test' package.json > /dev/null; then
+            /tmp/ingest.sh testing info "Running tests inside the sandbox"
+            if ! openshell sandbox exec -n aether-job -- sh -c 'cd "$1" || exit 1
+                if ! command -v npm >/dev/null; then echo "no npm in the sandbox image — tests skipped"; exit 0; fi
+                [ -d node_modules ] || npm install --no-audit --no-fund || exit 1
+                npm test' sh "$SBX_WORK" </dev/null; then
+              /tmp/ingest.sh failed err "Tests failed inside the sandbox — nothing was pushed. If the sandbox refused something (npm needs registry.npmjs.org), allow it on the deck and run again"
+              exit 1
+            fi
+          fi
+          # bring the changes out: no .git, no .github, no node_modules, nothing protected
+          mkdir -p /tmp/sbx-out && openshell sandbox download aether-job "$SBX_WORK" /tmp/sbx-out </dev/null
+          SRC=/tmp/sbx-out; [ -d /tmp/sbx-out/repo ] && SRC=/tmp/sbx-out/repo
+          if [ -z "$(ls -A "$SRC")" ]; then /tmp/ingest.sh failed err "Couldn't copy the agent's work out of the sandbox"; exit 1; fi
+          EXCL=(--exclude .git --exclude .github --exclude node_modules)
+          IFS=',' read -ra P <<< "$PROTECTED"; for x in "${P[@]}"; do x="$(echo "$x" | xargs)"; [ -n "$x" ] && EXCL+=(--exclude "$x"); done
+          # --delete mirrors files the agent removed; excluded paths are never deleted
+          rsync -a --delete "${EXCL[@]}" "$SRC"/ ./
+          /tmp/ingest.sh editing info "Agent finished in the sandbox — checking for changes"
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
+      - name: Contained — report what the sandbox refused
+        if: always() && env.CONTAINED == 'true'
+        run: |
+          openshell logs aether-job --since 60m --source sandbox 2>/dev/null | grep -E 'NET:OPEN \[[A-Z]+\] DENIED|HTTP:[A-Z]+ \[[A-Z]+\] DENIED' | tail -40 > /tmp/denials.txt || true
+          if [ -s /tmp/denials.txt ]; then
+            N=$(wc -l < /tmp/denials.txt)
+            /tmp/ingest.sh blocked err "The sandbox refused $N request(s) — approve or deny them on the deck" "$(jq -Rsc 'split("\n") | map(select(length>0)) | {denials:.}' /tmp/denials.txt)"
+          fi
+          openshell sandbox delete aether-job >/dev/null 2>&1 || true
+        env:
+          AETHER_INGEST_TOKEN: ${{ secrets.AETHER_INGEST_TOKEN }}
+
       - name: Run Claude Code
         id: claude
+        if: env.CONTAINED != 'true'
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Subscription first; the API key only when no OAuth token is set.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
           prompt: |
             ${{ env.DRY_RUN == 'true' && 'DRY RUN — produce a detailed plan of the changes you would make, written to PLAN.md. Do NOT modify any other files.' || 'Implement the following. Follow this repository''s CLAUDE.md conventions. Run existing tests and make them pass.' }}
 
@@ -89,6 +260,7 @@ jobs:
 
       - name: Run tests
         id: tests
+        if: env.CONTAINED != 'true'
         run: |
           /tmp/ingest.sh testing info "Running test suite"
           if [ -f package.json ] && jq -e '.scripts.test' package.json > /dev/null; then
